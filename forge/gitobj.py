@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import zlib
+from collections import deque
 
 ZERO_OID = "0" * 40
 
@@ -22,25 +23,42 @@ def hash_object(type_name: str, data: bytes) -> str:
     return hashlib.sha1(header + data).hexdigest()
 
 
-def pack_bytes(objects: list[tuple[str, str, bytes]]) -> bytes:
-    """Build a version-2 pack holding (sha, type, data) entries, no deltas."""
-    out = bytearray()
-    out += b"PACK"
-    out += (2).to_bytes(4, "big")
-    out += len(objects).to_bytes(4, "big")
-    for _sha, type_name, data in objects:
+# Pack entries are content-addressed and immutable, so an object's entry
+# (varint header + zlib stream) is built once and reused by every pack that
+# carries it. The cache is transparent: it never changes the bytes produced.
+_entry_cache: dict[str, bytes] = {}
+_ENTRY_CACHE_LIMIT = 100_000
+
+
+def _pack_entry(sha: str, type_name: str, data: bytes) -> bytes:
+    entry = _entry_cache.get(sha)
+    if entry is None:
         size = len(data)
         type_id = TYPE_IDS[type_name]
         first = (type_id << 4) | (size & 0x0F)
         size >>= 4
         if size:
             first |= 0x80
-        out.append(first)
+        header = bytearray([first])
         while size:
             chunk = size & 0x7F
             size >>= 7
-            out.append(chunk | (0x80 if size else 0))
-        out += zlib.compress(data)
+            header.append(chunk | (0x80 if size else 0))
+        entry = bytes(header) + zlib.compress(data)
+        if len(_entry_cache) >= _ENTRY_CACHE_LIMIT:
+            _entry_cache.clear()
+        _entry_cache[sha] = entry
+    return entry
+
+
+def pack_bytes(objects: list[tuple[str, str, bytes]]) -> bytes:
+    """Build a version-2 pack holding (sha, type, data) entries, no deltas."""
+    out = bytearray()
+    out += b"PACK"
+    out += (2).to_bytes(4, "big")
+    out += len(objects).to_bytes(4, "big")
+    for sha, type_name, data in objects:
+        out += _pack_entry(sha, type_name, data)
     trailer = hashlib.sha1(bytes(out)).digest()
     out += trailer
     return bytes(out)
@@ -325,27 +343,74 @@ def peel_to_commit(store: dict[str, tuple[str, bytes]], sha: str) -> str | None:
     return None
 
 
+def commit_parents(data: bytes) -> list[str]:
+    """Parent shas of a commit, read from the header bytes only.
+
+    Byte-exact equivalent of parse_commit(data)["parents"] for well-formed
+    commits, without decoding the message body.
+    """
+    header_end = data.find(b"\n\n")
+    head = data if header_end < 0 else data[:header_end]
+    parents = []
+    for line in head.split(b"\n"):
+        if line.startswith(b"parent "):
+            parents.append(line[7:].strip().decode("ascii"))
+    return parents
+
+
+def commit_tree(data: bytes) -> str | None:
+    """Tree sha of a commit, read from the header bytes only."""
+    header_end = data.find(b"\n\n")
+    head = data if header_end < 0 else data[:header_end]
+    for line in head.split(b"\n"):
+        if line.startswith(b"tree "):
+            return line[5:].strip().decode("ascii")
+    return None
+
+
 def commit_ancestors(store: dict[str, tuple[str, bytes]], tip: str) -> dict[str, int]:
     """Map of commit sha -> generation distance from tip (tip = 0)."""
     distances: dict[str, int] = {}
     if tip not in store:
         return distances
-    queue = [(tip, 0)]
+    queue: deque[tuple[str, int]] = deque([(tip, 0)])
     while queue:
-        sha, dist = queue.pop(0)
+        sha, dist = queue.popleft()
         if sha in distances and distances[sha] <= dist:
             continue
         entry = store.get(sha)
         if entry is None or entry[0] != "commit":
             continue
         distances[sha] = dist
-        for parent in parse_commit(entry[1])["parents"]:
+        for parent in commit_parents(entry[1]):
             queue.append((parent, dist + 1))
     return distances
 
 
 def is_ancestor(store: dict[str, tuple[str, bytes]], ancestor: str, tip: str) -> bool:
-    return ancestor in commit_ancestors(store, tip)
+    """True when ancestor is tip itself or reachable from tip via parents.
+
+    Depth-first with early exit: the common fast-forward case (ancestor is
+    the tip's parent) costs one step instead of a full ancestry walk.
+    """
+    if ancestor == tip:
+        entry = store.get(tip)
+        return entry is not None and entry[0] == "commit"
+    seen: set[str] = set()
+    stack = [tip]
+    while stack:
+        sha = stack.pop()
+        if sha in seen:
+            continue
+        seen.add(sha)
+        entry = store.get(sha)
+        if entry is None or entry[0] != "commit":
+            continue
+        for parent in commit_parents(entry[1]):
+            if parent == ancestor:
+                return True
+            stack.append(parent)
+    return False
 
 
 def merge_base(store: dict[str, tuple[str, bytes]], a: str, b: str) -> str | None:
@@ -406,8 +471,7 @@ def reachable_objects(
         if entry is None or entry[0] != "commit":
             continue
         commit_depth[sha] = dist
-        parsed = parse_commit(entry[1])
-        parents = parsed["parents"]
+        parents = commit_parents(entry[1])
         if sha in cut:
             parents = []
         if depth is not None and dist + 1 >= depth and parents:
@@ -421,7 +485,9 @@ def reachable_objects(
         if sha in excluded:
             continue
         included.add(sha)
-        tree = parse_commit(store[sha][1])["tree"]
+        tree = commit_tree(store[sha][1])
+        if tree is None:
+            continue
         stack = [tree]
         while stack:
             current = stack.pop()

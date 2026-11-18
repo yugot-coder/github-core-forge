@@ -5,11 +5,16 @@ headers its protocol checks require.
 
 from __future__ import annotations
 
+import email.message
+import email.utils
+import gc
 import itertools
+from http import HTTPStatus
 import json
 import os
 import socket
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -26,11 +31,33 @@ class App:
         self.token = os.environ.get("MAKEFUN_SHOP_TOKEN", "")
         self._request_counter = itertools.count(1)
         self._counter_lock = threading.Lock()
+        # GET response cache: (host, path, query) -> (epoch, status, body,
+        # content_type, headers). An entry is served only while the epoch it
+        # was stored under is current; every mutating request bumps the
+        # epoch, so a cached body can never outlive a state change. The
+        # cached bytes are exactly what the uncached path would send.
+        self._epoch = 0
+        self._get_cache: dict = {}
 
     def next_request_id(self) -> str:
         with self._counter_lock:
             value = next(self._request_counter)
         return f"{value:08x}-forge"
+
+    def bump_epoch(self) -> None:
+        with self._counter_lock:
+            self._epoch += 1
+        if len(self._get_cache) > 8192:
+            self._get_cache.clear()
+
+    def cache_get(self, key):
+        entry = self._get_cache.get(key)
+        if entry is not None and entry[0] == self._epoch:
+            return entry[1]
+        return None
+
+    def cache_put(self, key, epoch: int, value) -> None:
+        self._get_cache[key] = (epoch, value)
 
     def authorized(self, headers) -> bool:
         header = headers.get("Authorization")
@@ -58,6 +85,68 @@ def make_handler(app: App):
         def log_message(self, fmt, *args):  # keep stdout clean
             pass
 
+        # The stock parse_request routes headers through the email package's
+        # feedparser, which costs more than the rest of a small request
+        # combined. This fast path mirrors CPython 3.12's parse_request for
+        # the well-formed case (three-word request line, HTTP/1.0 or 1.1,
+        # plain "Name: value" headers) and defers to the stock implementation
+        # — before consuming anything — whenever the request line is unusual.
+        def parse_request(self):
+            requestline = str(self.raw_requestline, "iso-8859-1").rstrip("\r\n")
+            words = requestline.split()
+            if len(words) != 3 or words[2] not in ("HTTP/1.0", "HTTP/1.1"):
+                return super().parse_request()
+            self.command = None
+            self.request_version = words[2]
+            self.close_connection = words[2] == "HTTP/1.0"
+            self.requestline = requestline
+            self.command, self.path = words[0], words[1]
+            if self.path.startswith("//"):
+                self.path = "/" + self.path.lstrip("/")
+            headers = email.message.Message()
+            count = 0
+            while True:
+                line = self.rfile.readline(65537)
+                if line in (b"\r\n", b"\n", b""):
+                    break
+                if len(line) > 65536:
+                    self.send_error(431, "Line too long")
+                    return False
+                count += 1
+                if count > 100:
+                    self.send_error(431, "Too many headers")
+                    return False
+                name, sep, value = line.decode("iso-8859-1").partition(":")
+                if not sep or not name.strip():
+                    self.send_error(400, "Bad request syntax (%r)" % requestline)
+                    return False
+                headers[name.strip()] = value.strip()
+            self.headers = headers
+            conntype = headers.get("Connection", "")
+            if conntype.lower() == "close":
+                self.close_connection = True
+            elif conntype.lower() == "keep-alive" and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            expect = headers.get("Expect", "")
+            if (expect.lower() == "100-continue" and self.protocol_version >= "HTTP/1.1"
+                    and self.request_version >= "HTTP/1.1"):
+                if not self.handle_expect_100():
+                    return False
+            return True
+
+        _date_cache = [0, ""]
+
+        def date_time_string(self, timestamp=None):
+            if timestamp is not None:
+                return email.utils.formatdate(timestamp, usegmt=True)
+            now = time.time()
+            second = int(now)
+            cache = Handler._date_cache
+            if cache[0] != second:
+                cache[0] = second
+                cache[1] = email.utils.formatdate(now, usegmt=True)
+            return cache[1]
+
         # -- plumbing ---------------------------------------------------------
         def _read_body(self) -> bytes:
             transfer = (self.headers.get("Transfer-Encoding") or "").lower()
@@ -84,17 +173,36 @@ def make_handler(app: App):
                 return b""
             return self.rfile.read(int(length))
 
+        _server_version = None
+
         def _send(self, status: int, body: bytes, content_type: str | None, extra: dict | None = None):
-            self.send_response(status)
+            # One send for the whole response (status line, headers, body):
+            # the stock send_response/send_header/end_headers path costs
+            # several calls and two socket writes per reply. The bytes on
+            # the wire are identical, in the same header order.
+            if Handler._server_version is None:
+                Handler._server_version = self.version_string()
+            try:
+                reason = HTTPStatus(status).phrase
+            except ValueError:
+                reason = "Unknown"
+            lines = [
+                f"HTTP/1.1 {status} {reason}\r\n",
+                f"Server: {Handler._server_version}\r\n",
+                f"Date: {self.date_time_string()}\r\n",
+            ]
             if content_type is not None:
-                self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-GitHub-Request-Id", app.next_request_id())
+                lines.append(f"Content-Type: {content_type}\r\n")
+            lines.append(f"Content-Length: {len(body)}\r\n")
+            lines.append(f"X-GitHub-Request-Id: {app.next_request_id()}\r\n")
             for key, value in (extra or {}).items():
-                self.send_header(key, value)
-            self.end_headers()
+                lines.append(f"{key}: {value}\r\n")
+            lines.append("\r\n")
+            head = "".join(lines).encode("iso-8859-1")
             if body and self.command != "HEAD":
-                self.wfile.write(body)
+                self.wfile.write(head + body)
+            else:
+                self.wfile.write(head)
 
         def _send_json(self, status: int, payload, extra: dict | None = None):
             if payload is None:
@@ -119,6 +227,19 @@ def make_handler(app: App):
                     pass
 
         def _route(self, method: str):
+            # Fast path: a cached REST GET needs nothing but the raw target.
+            if method in ("GET", "HEAD"):
+                target = self.path
+                if target == "/api/v3" or target.startswith(("/api/v3/", "/api/v3?")):
+                    if not app.authorized(self.headers):
+                        self._send_json(401, {"message": "Requires authentication"})
+                        return
+                    host = self.headers.get("Host", "127.0.0.1")
+                    hit = app.cache_get((host, target))
+                    if hit is not None:
+                        status, resp_body, content_type, headers = hit
+                        self._send(status, resp_body, content_type, headers)
+                        return
             split = urlsplit(self.path)
             raw_path = split.path
             query = parse_qs(split.query)
@@ -137,6 +258,7 @@ def make_handler(app: App):
                 if not app.authorized(self.headers):
                     self._send_json(401, {"message": "Requires authentication"})
                     return
+                app.bump_epoch()  # MCP tools can mutate
                 status, payload, content_type = mcp.handle_mcp(app.store, raw_body)
                 if payload is None:
                     self._send(status, b"", None)
@@ -156,6 +278,7 @@ def make_handler(app: App):
                 except Exception:
                     self._send_json(400, {"message": "Problems parsing JSON"})
                     return
+                app.bump_epoch()  # GraphQL mutations can mutate
                 status, result = graphql.handle_graphql(app.store, payload)
                 self._send_json(status, result)
                 return
@@ -164,6 +287,14 @@ def make_handler(app: App):
                 if not app.authorized(self.headers):
                     self._send_json(401, {"message": "Requires authentication"})
                     return
+                cache_key = None
+                if method in ("GET", "HEAD"):
+                    cache_key = (host, self.path)
+                    hit = app.cache_get(cache_key)
+                    if hit is not None:
+                        status, resp_body, content_type, headers = hit
+                        self._send(status, resp_body, content_type, headers)
+                        return
                 body = None
                 if raw_body:
                     try:
@@ -173,14 +304,25 @@ def make_handler(app: App):
                         return
                 rest_segments = segments[2:] if len(segments) > 2 else []
                 ctx = rest.Ctx(app.store, base_url)
+                # The epoch is bumped (for mutations) and read (for cache
+                # stores) inside the store lock, together with the state
+                # access itself, so a cached body always matches the epoch
+                # it is tagged with.
                 with app.store.lock:
+                    if cache_key is None:
+                        app.bump_epoch()
+                    epoch = app._epoch
                     status, payload, extra = rest.handle(ctx, method, rest_segments, query, body)
                 headers = {"X-OAuth-Scopes": SCOPES}
                 headers.update(extra or {})
                 if payload is None:
-                    self._send(status, b"", None, headers)
+                    resp_body, content_type = b"", None
                 else:
-                    self._send_json(status, payload, headers)
+                    resp_body = json.dumps(payload).encode("utf-8")
+                    content_type = "application/json; charset=utf-8"
+                if cache_key is not None:
+                    app.cache_put(cache_key, epoch, (status, resp_body, content_type, headers))
+                self._send(status, resp_body, content_type, headers)
                 return
 
             # Git smart HTTP: /{owner}/{repo}.git/...
@@ -212,6 +354,7 @@ def make_handler(app: App):
                         if tail == "git-upload-pack":
                             status, content_type, body_out = gitproto.upload_pack(repo, self.headers, raw_body)
                         else:
+                            app.bump_epoch()  # pushes mutate objects and refs
                             status, content_type, body_out = gitproto.receive_pack(repo, raw_body)
                     self._send(status, body_out, content_type)
                     return
@@ -236,6 +379,11 @@ class ForgeHTTPServer(ThreadingHTTPServer):
 
 
 def serve(store: Store, host: str = "", port: int = 0) -> ThreadingHTTPServer:
+    # The forge is allocation-heavy and long-lived; the default gen0
+    # threshold makes the cyclic GC scan constantly for almost no benefit
+    # (the object graph is overwhelmingly acyclic). Raising the thresholds
+    # is invisible to every response — it only removes pauses.
+    gc.set_threshold(100_000, 100, 100)
     app = App(store)
     server = ForgeHTTPServer((host, port), make_handler(app))
     return server

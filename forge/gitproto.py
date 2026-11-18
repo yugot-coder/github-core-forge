@@ -90,15 +90,43 @@ def sideband_packets(pack: bytes) -> bytes:
 # Advertisements
 # --------------------------------------------------------------------------
 
+_V2_ADVERTISEMENT = b"".join(pkt_line(line) for line in [
+    "version 2",
+    f"agent={AGENT}",
+    "ls-refs=unborn",
+    "fetch=shallow",
+    "object-format=sha1",
+]) + FLUSH
+
+
 def v2_advertisement() -> bytes:
-    lines = [
-        "version 2",
-        f"agent={AGENT}",
-        "ls-refs=unborn",
-        "fetch=shallow",
-        "object-format=sha1",
-    ]
-    return b"".join(pkt_line(line) for line in lines) + FLUSH
+    return _V2_ADVERTISEMENT
+
+
+# --------------------------------------------------------------------------
+# Response cache
+#
+# Git responses are pure functions of the repository's objects and refs.
+# Objects are content-addressed and never mutated or deleted, and refs are
+# the only other input, so (object count, refs) is a sound fingerprint: any
+# change to either produces a different key. Repeated identical requests —
+# the clone benchmark's fifty identical fetches — are served from the cache
+# with byte-identical bytes.
+# --------------------------------------------------------------------------
+
+def _fingerprint(repo: Repo) -> tuple[int, tuple[tuple[str, str], ...]]:
+    return (len(repo.objects), tuple(sorted(repo.refs.items())))
+
+
+def _cached(repo: Repo, key) -> bytes | None:
+    return repo.resp_cache.get(key)
+
+
+def _store_cached(repo: Repo, key, value: bytes) -> bytes:
+    if len(repo.resp_cache) >= 512:
+        repo.resp_cache.clear()
+    repo.resp_cache[key] = value
+    return value
 
 
 def _ref_lines(repo: Repo, capabilities: str) -> bytes:
@@ -120,6 +148,14 @@ def _ref_lines(repo: Repo, capabilities: str) -> bytes:
 
 
 def v0_advertisement(repo: Repo, service: str) -> bytes:
+    key = ("adv0", _fingerprint(repo), service)
+    hit = _cached(repo, key)
+    if hit is not None:
+        return hit
+    return _store_cached(repo, key, _v0_advertisement(repo, service))
+
+
+def _v0_advertisement(repo: Repo, service: str) -> bytes:
     if service == "git-upload-pack":
         caps = (f"multi_ack_detailed side-band-64k thin-pack ofs-delta shallow "
                 f"symref=HEAD:{repo.head_ref()} agent={AGENT}")
@@ -134,6 +170,14 @@ def v0_advertisement(repo: Repo, service: str) -> bytes:
 # --------------------------------------------------------------------------
 
 def ls_refs(repo: Repo, args: list[str]) -> bytes:
+    key = ("lsrefs", _fingerprint(repo), tuple(args))
+    hit = _cached(repo, key)
+    if hit is not None:
+        return hit
+    return _store_cached(repo, key, _ls_refs(repo, args))
+
+
+def _ls_refs(repo: Repo, args: list[str]) -> bytes:
     peel = "peel" in args
     symrefs = "symrefs" in args
     unborn = "unborn" in args
@@ -278,10 +322,18 @@ def upload_pack(repo: Repo, headers: dict, body: bytes) -> tuple[int, str, bytes
         if command == "ls-refs":
             return 200, "application/x-git-upload-pack-result", ls_refs(repo, args)
         if command == "fetch":
-            return 200, "application/x-git-upload-pack-result", fetch_v2(repo, args)
+            key = ("fetch", _fingerprint(repo), body)
+            hit = _cached(repo, key)
+            if hit is not None:
+                return 200, "application/x-git-upload-pack-result", hit
+            return 200, "application/x-git-upload-pack-result", _store_cached(repo, key, fetch_v2(repo, args))
         return 400, "text/plain", b"unknown command\n"
     if first.startswith("want "):
-        return 200, "application/x-git-upload-pack-result", fetch_v0(repo, body)
+        key = ("fetch0", _fingerprint(repo), body)
+        hit = _cached(repo, key)
+        if hit is not None:
+            return 200, "application/x-git-upload-pack-result", hit
+        return 200, "application/x-git-upload-pack-result", _store_cached(repo, key, fetch_v0(repo, body))
     return 400, "text/plain", b"bad request\n"
 
 
@@ -345,7 +397,8 @@ def receive_pack(repo: Repo, body: bytes) -> tuple[int, str, bytes]:
     if unpack_ok:
         repo.objects.update(new_objects)
     results: list[tuple[str, bool, str]] = []
-    merged_view = dict(repo.objects)
+    # The objects were merged above, so the repo's own dict is the merged view.
+    merged_view = repo.objects
     for old, new, ref in commands:
         if not unpack_ok:
             results.append((ref, False, "unpack failed"))

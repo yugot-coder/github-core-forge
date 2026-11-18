@@ -13,6 +13,7 @@ import base64
 import difflib
 import os
 import threading
+from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -37,10 +38,12 @@ def _trial_now_base() -> int:
     return 1_735_689_600  # 2025-01-01T00:00:00Z, the scenario's day one
 
 
+@lru_cache(maxsize=16384)
 def iso8601(epoch: int) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+@lru_cache(maxsize=16384)
 def node_id(type_name: str, db_id: int) -> str:
     return base64.b64encode(f"{type_name}:{db_id}".encode("ascii")).decode("ascii")
 
@@ -122,6 +125,8 @@ class Repo:
     next_label_id: int = 1
     created_tick: int = 0
     updated_tick: int = 0
+    # gitproto response cache (see gitproto._fingerprint); never serialized.
+    resp_cache: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def full_name(self) -> str:
