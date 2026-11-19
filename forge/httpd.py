@@ -5,10 +5,10 @@ headers its protocol checks require.
 
 from __future__ import annotations
 
-import email.message
 import email.utils
 import gc
 import itertools
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 import json
 import os
@@ -23,6 +23,48 @@ from . import gitproto, graphql, mcp, rest
 from .store import ForgeError, Store
 
 SCOPES = "repo, read:org"
+
+
+class _Headers:
+    """Minimal case-insensitive header map for the fast parse path.
+
+    The stock parser routes headers through the email package, whose
+    Message set/get are linear scans with per-call case folding — measurably
+    the priciest part of a small request. Everything in this codebase (and
+    in BaseHTTPRequestHandler's own helpers) reads headers through
+    ``.get(name[, default])`` only, so a lower-cased dict is a drop-in:
+    duplicate names keep the last value, exactly as Message.__setitem__
+    replaces an existing header.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self):
+        self._values: dict[str, str] = {}
+
+    def __setitem__(self, name: str, value: str) -> None:
+        self._values[name.lower()] = value
+
+    def get(self, name: str, default=None):
+        return self._values.get(name.lower(), default)
+
+    def __contains__(self, name: str) -> bool:
+        return name.lower() in self._values
+
+
+_STATUS_LINES: dict[int, str] = {}
+
+
+def _status_line(status: int) -> str:
+    line = _STATUS_LINES.get(status)
+    if line is None:
+        try:
+            reason = HTTPStatus(status).phrase
+        except ValueError:
+            reason = "Unknown"
+        line = f"HTTP/1.1 {status} {reason}\r\n"
+        _STATUS_LINES[status] = line
+    return line
 
 
 class App:
@@ -56,8 +98,12 @@ class App:
             return entry[1]
         return None
 
-    def cache_put(self, key, epoch: int, value) -> None:
-        self._get_cache[key] = (epoch, value)
+    def cache_put(self, key, epoch: int, value, skeleton=None) -> None:
+        # value is (status, body, content_type, extra_headers); skeleton,
+        # when given, is the response head in three pieces around the two
+        # per-request fields (Date value, request id) so a cache hit can be
+        # served with a single join + write instead of rebuilding the head.
+        self._get_cache[key] = (epoch, value + (skeleton,))
 
     def authorized(self, headers) -> bool:
         header = headers.get("Authorization")
@@ -103,7 +149,7 @@ def make_handler(app: App):
             self.command, self.path = words[0], words[1]
             if self.path.startswith("//"):
                 self.path = "/" + self.path.lstrip("/")
-            headers = email.message.Message()
+            headers = _Headers()
             count = 0
             while True:
                 line = self.rfile.readline(65537)
@@ -135,6 +181,7 @@ def make_handler(app: App):
             return True
 
         _date_cache = [0, ""]
+        _date_bytes_cache = [0, b""]
 
         def date_time_string(self, timestamp=None):
             if timestamp is not None:
@@ -145,6 +192,15 @@ def make_handler(app: App):
             if cache[0] != second:
                 cache[0] = second
                 cache[1] = email.utils.formatdate(now, usegmt=True)
+            return cache[1]
+
+        def _date_bytes(self) -> bytes:
+            now = time.time()
+            second = int(now)
+            cache = Handler._date_bytes_cache
+            if cache[0] != second:
+                cache[0] = second
+                cache[1] = email.utils.formatdate(now, usegmt=True).encode("iso-8859-1")
             return cache[1]
 
         # -- plumbing ---------------------------------------------------------
@@ -175,34 +231,46 @@ def make_handler(app: App):
 
         _server_version = None
 
+        def _head_skeleton(self, status: int, body_len: int, content_type: str | None,
+                           extra: dict | None):
+            """The response head as (pre, mid, post) around the Date value and
+            the request id — the only two per-request fields. Everything else
+            is fixed for a given (status, length, type, extras) shape."""
+            if Handler._server_version is None:
+                Handler._server_version = self.version_string()
+            pre = (_status_line(status)
+                   + f"Server: {Handler._server_version}\r\n"
+                   + "Date: ").encode("iso-8859-1")
+            mid = "\r\n"
+            if content_type is not None:
+                mid += f"Content-Type: {content_type}\r\n"
+            mid += f"Content-Length: {body_len}\r\n"
+            mid += "X-GitHub-Request-Id: "
+            post = "\r\n"
+            for key, value in (extra or {}).items():
+                post += f"{key}: {value}\r\n"
+            post += "\r\n"
+            return (pre, mid.encode("iso-8859-1"), post.encode("iso-8859-1"))
+
         def _send(self, status: int, body: bytes, content_type: str | None, extra: dict | None = None):
             # One send for the whole response (status line, headers, body):
             # the stock send_response/send_header/end_headers path costs
             # several calls and two socket writes per reply. The bytes on
             # the wire are identical, in the same header order.
-            if Handler._server_version is None:
-                Handler._server_version = self.version_string()
-            try:
-                reason = HTTPStatus(status).phrase
-            except ValueError:
-                reason = "Unknown"
-            lines = [
-                f"HTTP/1.1 {status} {reason}\r\n",
-                f"Server: {Handler._server_version}\r\n",
-                f"Date: {self.date_time_string()}\r\n",
-            ]
-            if content_type is not None:
-                lines.append(f"Content-Type: {content_type}\r\n")
-            lines.append(f"Content-Length: {len(body)}\r\n")
-            lines.append(f"X-GitHub-Request-Id: {app.next_request_id()}\r\n")
-            for key, value in (extra or {}).items():
-                lines.append(f"{key}: {value}\r\n")
-            lines.append("\r\n")
-            head = "".join(lines).encode("iso-8859-1")
+            pre, mid, post = self._head_skeleton(status, len(body), content_type, extra)
+            request_id = app.next_request_id().encode("iso-8859-1")
             if body and self.command != "HEAD":
-                self.wfile.write(head + body)
+                self.wfile.write(b"".join((pre, self._date_bytes(), mid, request_id, post, body)))
             else:
-                self.wfile.write(head)
+                self.wfile.write(b"".join((pre, self._date_bytes(), mid, request_id, post)))
+
+        def _send_cached(self, skeleton, body: bytes):
+            pre, mid, post = skeleton
+            request_id = app.next_request_id().encode("iso-8859-1")
+            if body and self.command != "HEAD":
+                self.wfile.write(b"".join((pre, self._date_bytes(), mid, request_id, post, body)))
+            else:
+                self.wfile.write(b"".join((pre, self._date_bytes(), mid, request_id, post)))
 
         def _send_json(self, status: int, payload, extra: dict | None = None):
             if payload is None:
@@ -237,13 +305,17 @@ def make_handler(app: App):
                     host = self.headers.get("Host", "127.0.0.1")
                     hit = app.cache_get((host, target))
                     if hit is not None:
-                        status, resp_body, content_type, headers = hit
-                        self._send(status, resp_body, content_type, headers)
+                        status, resp_body, content_type, headers, skeleton = hit
+                        if skeleton is not None:
+                            self._send_cached(skeleton, resp_body)
+                        else:
+                            self._send(status, resp_body, content_type, headers)
                         return
             split = urlsplit(self.path)
             raw_path = split.path
             query = parse_qs(split.query)
-            segments = [unquote(part) for part in raw_path.split("/") if part != ""]
+            segments = [part if "%" not in part else unquote(part)
+                        for part in raw_path.split("/") if part != ""]
             host = self.headers.get("Host", "127.0.0.1")
             base_url = f"http://{host}"
             # Always drain the request body first: an early response (401/404)
@@ -292,8 +364,11 @@ def make_handler(app: App):
                     cache_key = (host, self.path)
                     hit = app.cache_get(cache_key)
                     if hit is not None:
-                        status, resp_body, content_type, headers = hit
-                        self._send(status, resp_body, content_type, headers)
+                        status, resp_body, content_type, headers, skeleton = hit
+                        if skeleton is not None:
+                            self._send_cached(skeleton, resp_body)
+                        else:
+                            self._send(status, resp_body, content_type, headers)
                         return
                 body = None
                 if raw_body:
@@ -321,7 +396,8 @@ def make_handler(app: App):
                     resp_body = json.dumps(payload).encode("utf-8")
                     content_type = "application/json; charset=utf-8"
                 if cache_key is not None:
-                    app.cache_put(cache_key, epoch, (status, resp_body, content_type, headers))
+                    skeleton = self._head_skeleton(status, len(resp_body), content_type, headers)
+                    app.cache_put(cache_key, epoch, (status, resp_body, content_type, headers), skeleton)
                 self._send(status, resp_body, content_type, headers)
                 return
 
@@ -376,6 +452,60 @@ def make_handler(app: App):
 class ForgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 256
+    # ThreadingHTTPServer spawns a fresh thread per connection. The clone
+    # benchmark alone opens ~150 connections per round, and a thread spawn
+    # (a clone syscall, dearer still under a sandboxed runtime) costs more
+    # than the small responses it serves. A pre-spawned pool of workers
+    # removes the spawn from the request path entirely; the wire behaviour
+    # of every connection is unchanged.
+    POOL_WORKERS = 128
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pool: ThreadPoolExecutor | None = None
+
+    def start_pool(self) -> None:
+        if self._pool is not None:
+            return
+        pool = ThreadPoolExecutor(max_workers=self.POOL_WORKERS,
+                                  thread_name_prefix="forge-http")
+        # Pre-spawn every worker: submit tasks that park on an event until
+        # all workers exist, then release them.
+        gate = threading.Event()
+        started = threading.Semaphore(0)
+
+        def _park():
+            started.release()
+            gate.wait(30)
+
+        futures = [pool.submit(_park) for _ in range(self.POOL_WORKERS)]
+        for _ in range(self.POOL_WORKERS):
+            started.acquire()
+        gate.set()
+        for future in futures:
+            future.result()
+        self._pool = pool
+
+    def process_request(self, request, client_address):
+        if self._pool is None:
+            super().process_request(request, client_address)
+            return
+        self._pool.submit(self._pool_task, request, client_address)
+
+    def _pool_task(self, request, client_address):
+        # Mirrors ThreadingMixIn.process_request_thread.
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+    def server_close(self):
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+        super().server_close()
 
 
 def serve(store: Store, host: str = "", port: int = 0) -> ThreadingHTTPServer:
@@ -386,4 +516,5 @@ def serve(store: Store, host: str = "", port: int = 0) -> ThreadingHTTPServer:
     gc.set_threshold(100_000, 100, 100)
     app = App(store)
     server = ForgeHTTPServer((host, port), make_handler(app))
+    server.start_pool()
     return server
